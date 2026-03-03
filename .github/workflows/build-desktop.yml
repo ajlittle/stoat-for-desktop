@@ -138,12 +138,14 @@ jobs:
         run: |
           ZIP_FILE=$(ls -t out/make/zip/linux/x64/*.zip 2>/dev/null | head -1)
           if [ -n "$ZIP_FILE" ]; then
-            VERSION=${GITHUB_REF_NAME#v}
+            INPUT_VERSION="${{ github.event.inputs.version }}"
+            VERSION=${INPUT_VERSION:-${GITHUB_REF_NAME}}
+            VERSION=${VERSION#v}
             NEW_NAME="Stoat-Desktop-linux-x64-${VERSION}.zip"
             cp "$ZIP_FILE" "out/make/zip/linux/x64/$NEW_NAME"
             echo "zip_path=out/make/zip/linux/x64/$NEW_NAME" >> $GITHUB_OUTPUT
             echo "zip_name=$NEW_NAME" >> $GITHUB_OUTPUT
-            echo "Found ZIP: $ZIP_FILE"
+            echo "Found ZIP: $ZIP_FILE -> $NEW_NAME"
           else
             echo "ERROR: ZIP file not found"
             exit 1
@@ -286,14 +288,16 @@ jobs:
         run: |
           $zipFile = Get-ChildItem out/make/zip/win32/x64/*.zip | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if ($zipFile) {
-            $version = $env:GITHUB_REF_NAME -replace '^v', ''
+            $inputVersion = "${{ github.event.inputs.version }}"
+            $version = if ($inputVersion) { $inputVersion } else { $env:GITHUB_REF_NAME }
+            $version = $version -replace '^v', ''
             $newName = "Stoat-Desktop-win32-x64-$version.zip"
             Copy-Item $zipFile.FullName "out/make/zip/win32/x64/$newName"
             echo "zip_path=out/make/zip/win32/x64/$newName" >> $env:GITHUB_OUTPUT
             echo "zip_name=$newName" >> $env:GITHUB_OUTPUT
-            echo "Found ZIP: $($zipFile.FullName)"
+            Write-Host "Found ZIP: $($zipFile.FullName) -> $newName"
           } else {
-            echo "ERROR: ZIP file not found"
+            Write-Error "ERROR: ZIP file not found"
             exit 1
           }
 
@@ -360,7 +364,8 @@ jobs:
         uses: softprops/action-gh-release@v1
         with:
           files: artifacts/*.zip
-          name: Stoat Desktop ${{ github.ref_name }}
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: Stoat Desktop ${{ github.event.inputs.version || github.ref_name }}
           body_path: ${{ steps.changelog.outputs.changelog_file }}
           draft: false
           prerelease: false
