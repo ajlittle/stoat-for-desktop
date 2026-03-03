@@ -46,6 +46,9 @@ let isRestarting = false;
 let isWindowFocused = false;
 let keyspyRestartAttempts = 0;
 let keyspyRestartTimeout: NodeJS.Timeout | null = null;
+let crashHandled = false;
+let focusHandler: (() => void) | null = null;
+let blurHandler: (() => void) | null = null;
 const MAX_KEYSPY_RESTART_ATTEMPTS = 5;
 const KEYSPY_RESTART_DELAY_MS = 2000;
 
@@ -332,6 +335,7 @@ async function startKeyspy(): Promise<void> {
 
   isKeyspyIntentionallyStopped = false;
   isRestarting = false;
+  crashHandled = false;
 
   if (!GlobalKeyboardListener) {
     loadKeyspy();
@@ -348,25 +352,26 @@ async function startKeyspy(): Promise<void> {
     keyboardListenerInstance = new GlobalKeyboardListener();
 
     if (keyboardListenerInstance.proc) {
-      keyboardListenerInstance.proc.stdin?.on("error", (err: Error) => {
-        pttLog(`Keyspy stdin error (suppressed): ${err.message}`);
-      });
-      keyboardListenerInstance.proc.stdout?.on("error", (err: Error) => {
-        pttLog(`Keyspy stdout error (suppressed): ${err.message}`);
-      });
-      keyboardListenerInstance.proc.stderr?.on("error", (err: Error) => {
-        pttLog(`Keyspy stderr error (suppressed): ${err.message}`);
-      });
+      const suppressError = (err: Error) => {
+        pttLog(`Keyspy stream error (suppressed): ${err.message}`);
+      };
+      keyboardListenerInstance.proc.stdin?.on("error", suppressError);
+      keyboardListenerInstance.proc.stdout?.on("error", suppressError);
+      keyboardListenerInstance.proc.stderr?.on("error", suppressError);
 
-      keyboardListenerInstance.proc.on(
+      keyboardListenerInstance.proc.once(
         "exit",
         (code: number, signal: string) => {
+          if (crashHandled) return;
+          crashHandled = true;
           pttLog(`Keyspy process exited with code ${code}, signal: ${signal}`);
           handleKeyspyCrash("process-exit", code, signal);
         },
       );
 
-      keyboardListenerInstance.proc.on("error", (err: Error) => {
+      keyboardListenerInstance.proc.once("error", (err: Error) => {
+        if (crashHandled) return;
+        crashHandled = true;
         pttLog(`Keyspy process error: ${err.message}`);
         handleKeyspyCrash("process-error", -1, err.message);
       });
@@ -378,6 +383,12 @@ async function startKeyspy(): Promise<void> {
       }
 
       const keyName = normalizeKeyName(event.name);
+      const mappedKey = keyspyKeyToAccelerator(keyName);
+
+      if (!keyName) {
+        return false;
+      }
+
       const isKeyUpForActivePtt =
         event.state === "UP" && normalizeKeyName(pttActivationKey) === keyName;
       const isPttKey = isKeyUpForActivePtt
@@ -385,7 +396,7 @@ async function startKeyspy(): Promise<void> {
         : matchesKeyspyEvent(event, isDown);
 
       pttLog(
-        `Keyspy event: name=${event.name}, state=${event.state}, ` +
+        `Keyspy event: name=${event.name}, mapped=${mappedKey}, state=${event.state}, ` +
           `isPttKey=${isPttKey}, pttActive=${isPttActive}`,
       );
 
@@ -395,41 +406,39 @@ async function startKeyspy(): Promise<void> {
 
       if (config.pushToTalkMode === "hold") {
         if (event.state === "DOWN") {
-          const keyIdentifier = event.name;
-
-          if (heldKeys.has(keyIdentifier)) {
-            pttLog(`Ignoring auto-repeat for: ${keyIdentifier}`);
+          if (heldKeys.has(keyName) || heldKeys.has(mappedKey)) {
+            pttLog(`Ignoring auto-repeat for: ${keyName}`);
             return false;
           }
 
-          heldKeys.add(keyIdentifier);
+          heldKeys.add(keyName);
+          heldKeys.add(mappedKey);
 
           if (!isPttActive || pttActivationKey === null) {
-            pttActivationKey = keyIdentifier;
+            pttActivationKey = keyName;
             activatePtt("keyspy global keydown");
           }
         } else if (event.state === "UP") {
-          const keyIdentifier = event.name;
-          heldKeys.delete(keyIdentifier);
+          heldKeys.delete(keyName);
+          heldKeys.delete(mappedKey);
 
-          if (pttActivationKey === keyIdentifier) {
+          if (pttActivationKey === keyName || pttActivationKey === mappedKey) {
             pttActivationKey = null;
             deactivatePtt("keyspy global keyup");
           }
         }
       } else {
         if (event.state === "DOWN") {
-          const keyIdentifier = event.name;
-          if (heldKeys.has(keyIdentifier)) {
+          if (heldKeys.has(keyName)) {
             return false;
           }
-          heldKeys.add(keyIdentifier);
+          heldKeys.add(keyName);
 
           isPttActive = !isPttActive;
           sendPttState(isPttActive);
           pttLog("Keyspy PTT toggled:", isPttActive ? "ON" : "OFF");
         } else if (event.state === "UP") {
-          heldKeys.delete(event.name);
+          heldKeys.delete(keyName);
         }
       }
 
@@ -443,6 +452,7 @@ async function startKeyspy(): Promise<void> {
     pttLog("✓ Keyspy started successfully");
   } catch (err: any) {
     pttLog("✗ Failed to start keyspy:", err?.message || err);
+    isRestarting = false;
     handleKeyspyCrash("start-error", -1, err?.message || String(err));
   }
 }
@@ -483,19 +493,21 @@ function handleKeyspyCrash(
   }
 
   isRestarting = true;
-  const delay = KEYSPY_RESTART_DELAY_MS * keyspyRestartAttempts;
+  const delay = KEYSPY_RESTART_DELAY_MS + (keyspyRestartAttempts - 1) * 1000;
   pttLog(
     `Attempting to restart keyspy in ${delay}ms (attempt ${keyspyRestartAttempts}/${MAX_KEYSPY_RESTART_ATTEMPTS})...`,
   );
 
   keyspyRestartTimeout = setTimeout(async () => {
-    isRestarting = false;
     if (config.pushToTalk && mainWindow && !mainWindow.isDestroyed()) {
       try {
         await startKeyspy();
       } catch (err) {
         pttLog("Error during keyspy restart:", err);
+        isRestarting = false;
       }
+    } else {
+      isRestarting = false;
     }
   }, delay);
 }
@@ -548,24 +560,37 @@ export async function registerPushToTalkHotkey(): Promise<void> {
 
     await startKeyspy();
 
-    // track focus state for ignoring keyspy events when focused
-    mainWindow.on("focus", () => {
+    if (focusHandler) {
+      mainWindow.off("focus", focusHandler);
+    }
+    if (blurHandler) {
+      mainWindow.off("blur", blurHandler);
+    }
+
+    focusHandler = () => {
       if (!isWindowFocused) {
         pttLog("Window focused - keyspy events will be ignored");
         isWindowFocused = true;
-        heldKeys.clear();
-        pttActivationKey = null;
+        if (pttActivationKey) {
+          heldKeys.clear();
+          pttActivationKey = null;
+          deactivatePtt("window-focused", false);
+        }
       }
-    });
+    };
 
-    mainWindow.on("blur", () => {
+    blurHandler = () => {
       if (isWindowFocused) {
         pttLog("Window blurred - keyspy events will now be processed");
         isWindowFocused = false;
         heldKeys.clear();
         pttActivationKey = null;
+        deactivatePtt("window-blurred", false);
       }
-    });
+    };
+
+    mainWindow.on("focus", focusHandler);
+    mainWindow.on("blur", blurHandler);
   }
 
   isPttActive = false;
@@ -587,7 +612,17 @@ export function unregisterPushToTalkHotkey(): void {
 
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.off("before-input-event", handleBeforeInputEvent);
-    pttLog("Removed before-input-event listener");
+
+    if (focusHandler) {
+      mainWindow.off("focus", focusHandler);
+      focusHandler = null;
+    }
+    if (blurHandler) {
+      mainWindow.off("blur", blurHandler);
+      blurHandler = null;
+    }
+
+    pttLog("Removed all window listeners");
   }
 
   if (keyboardListenerInstance) {
@@ -601,6 +636,10 @@ export function unregisterPushToTalkHotkey(): void {
         /* ignore */
       }
       keyspyListener = null;
+    }
+
+    if (keyboardListenerInstance.proc) {
+      keyboardListenerInstance.proc.removeAllListeners();
     }
 
     try {
