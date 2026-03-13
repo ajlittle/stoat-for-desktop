@@ -30,7 +30,7 @@ jobs:
         if: ${{ !env.ACT }}
         uses: actions/checkout@v4
         with:
-          repository: Trifall/stoat-for-web
+          repository: ajlittle/stoat-for-web
           path: client
           fetch-depth: 0
           submodules: recursive
@@ -41,7 +41,7 @@ jobs:
         run: |
           if [ ! -d "client" ]; then
             echo "ERROR: client/ directory not found. For local testing with act, ensure client/ exists."
-            echo "Run: git clone https://github.com/Trifall/stoat-for-web client"
+            echo "Run: git clone https://github.com/ajlittle/stoat-for-web client"
             exit 1
           fi
           echo "client/ directory found"
@@ -176,7 +176,7 @@ jobs:
         if: ${{ !env.ACT }}
         uses: actions/checkout@v4
         with:
-          repository: Trifall/stoat-for-web
+          repository: ajlittle/stoat-for-web
           path: client
           fetch-depth: 0
           submodules: recursive
@@ -186,7 +186,7 @@ jobs:
         shell: pwsh
         run: |
           if (-Not (Test-Path "client")) {
-            Write-Error "ERROR: client/ directory not found. For local testing with act, ensure client/ exists. Run: git clone https://github.com/Trifall/stoat-for-web client"
+            Write-Error "ERROR: client/ directory not found. For local testing with act, ensure client/ exists. Run: git clone https://github.com/ajlittle/stoat-for-web client"
             exit 1
           }
           Write-Host "client/ directory found"
