@@ -12,6 +12,19 @@ let keyspyListener:
   | ((event: any, isDown: Record<string, boolean>) => boolean | void)
   | null = null;
 
+
+process.on("uncaughtException", (err: NodeJS.ErrnoException) => {
+  if (err.code === "EPIPE") {
+    pttLog("Caught EPIPE uncaught exception from keyspy");
+    if (!crashHandled && isKeyspyRunning && !isKeyspyIntentionallyStopped) {
+      crashHandled = true;
+      handleKeyspyCrash("epipe-uncaught", -1, err.message);
+    }
+    return;
+  }
+  throw err;
+});
+
 function loadKeyspy() {
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -51,6 +64,37 @@ let focusHandler: (() => void) | null = null;
 let blurHandler: (() => void) | null = null;
 const MAX_KEYSPY_RESTART_ATTEMPTS = 5;
 const KEYSPY_RESTART_DELAY_MS = 2000;
+const KEYSPY_WATCHDOG_MS = 3000;
+
+let keyspyWatchdogInterval: NodeJS.Timeout | null = null;
+
+function startKeyspyWatchdog() {
+  stopKeyspyWatchdog();
+  keyspyWatchdogInterval = setInterval(() => {
+    if (!isKeyspyRunning || isKeyspyIntentionallyStopped || crashHandled)
+      return;
+
+    const proc = keyboardListenerInstance?.proc;
+    if (!proc?.pid) return;
+
+    try {
+      process.kill(proc.pid, 0);
+    } catch {
+      if (!crashHandled) {
+        crashHandled = true;
+        pttLog("Watchdog detected dead keyspy process");
+        handleKeyspyCrash("watchdog", -1, "process not found");
+      }
+    }
+  }, KEYSPY_WATCHDOG_MS);
+}
+
+function stopKeyspyWatchdog() {
+  if (keyspyWatchdogInterval) {
+    clearInterval(keyspyWatchdogInterval);
+    keyspyWatchdogInterval = null;
+  }
+}
 
 let currentKeybind = "";
 let keybindModifiers = { ctrl: false, shift: false, alt: false, meta: false };
@@ -355,9 +399,23 @@ async function startKeyspy(): Promise<void> {
       const suppressError = (err: Error) => {
         pttLog(`Keyspy stream error (suppressed): ${err.message}`);
       };
-      keyboardListenerInstance.proc.stdin?.on("error", suppressError);
+      keyboardListenerInstance.proc.stdin?.on("error", (err: Error) => {
+        pttLog(`Keyspy stdin error: ${err.message}`);
+        if (!crashHandled && !isKeyspyIntentionallyStopped) {
+          crashHandled = true;
+          handleKeyspyCrash("stdin-error", -1, err.message);
+        }
+      });
       keyboardListenerInstance.proc.stdout?.on("error", suppressError);
       keyboardListenerInstance.proc.stderr?.on("error", suppressError);
+
+      keyboardListenerInstance.proc.stdout?.once("close", () => {
+        if (!crashHandled && !isKeyspyIntentionallyStopped) {
+          crashHandled = true;
+          pttLog("Keyspy stdout closed unexpectedly");
+          handleKeyspyCrash("stdout-close", -1, "stdout closed");
+        }
+      });
 
       keyboardListenerInstance.proc.once(
         "exit",
@@ -377,6 +435,8 @@ async function startKeyspy(): Promise<void> {
       });
     }
 
+    startKeyspyWatchdog();
+
     keyspyListener = (event: any, isDown: Record<string, boolean>) => {
       if (isWindowFocused) {
         return false;
@@ -385,7 +445,7 @@ async function startKeyspy(): Promise<void> {
       const keyName = normalizeKeyName(event.name);
       const mappedKey = keyspyKeyToAccelerator(keyName);
 
-      if (!keyName) {
+      if (!keyName || keyName === "unknown") {
         return false;
       }
 
@@ -485,6 +545,7 @@ function handleKeyspyCrash(
 
   keyboardListenerInstance = null;
   isKeyspyRunning = false;
+  stopKeyspyWatchdog();
   keyspyListener = null;
   keyspyRestartAttempts++;
 
@@ -611,6 +672,8 @@ export function unregisterPushToTalkHotkey(): void {
   pttLog("Unregistering PTT hotkey...");
 
   deactivatePtt("unregister", false);
+
+  stopKeyspyWatchdog();
 
   if (keyspyRestartTimeout) {
     clearTimeout(keyspyRestartTimeout);
